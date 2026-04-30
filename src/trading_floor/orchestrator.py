@@ -18,16 +18,26 @@ from typing import AsyncIterator
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
 
 from trading_floor.agents.risk_officer import build_risk_officer
 from trading_floor.agents.trader import build_trader
+from trading_floor.config import get_settings
 from trading_floor.crews.research_crew import run_research_crew
 from trading_floor.data.universe import all_tickers
 from trading_floor.mcp_client import open_floor
 from trading_floor.models import RiskAssessment, TradeProposal
 from trading_floor.state import FloorState
 from trading_floor.storage import audit_repo, portfolio_repo
+
+
+class _VerdictPayload(BaseModel):
+    approved: bool = Field(..., description="True only if the trade should be executed.")
+    reasons: list[str] = Field(default_factory=list)
+    suggested_quantity: int | None = None
+    risk_score: float = Field(0.5, ge=0.0, le=1.0)
 
 
 def _filter(tools: dict[str, BaseTool], substrings: list[str]) -> list[BaseTool]:
@@ -84,11 +94,58 @@ async def _research_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
         state["portfolio_snapshot"],
         tools,
     )
+    sized = _enforce_sizing(proposals, state["portfolio_snapshot"])
     return {
         "research_brief": brief,
-        "proposals": proposals,
-        "status_log": [f"Research crew produced {len(proposals)} proposal(s)"],
+        "proposals": sized,
+        "status_log": [
+            f"Research crew produced {len(proposals)} proposal(s); "
+            f"sizing-clipped to fit per-name limit"
+        ],
     }
+
+
+def _enforce_sizing(
+    proposals: list[TradeProposal], snapshot: dict
+) -> list[TradeProposal]:
+    """Apply hard policy guardrails before risk review.
+
+    - Drop SELL proposals on tickers the portfolio doesn't hold.
+    - Clip BUY quantities so no single trade can exceed the per-name cap.
+
+    This decouples policy enforcement from LLM compliance.
+    """
+    from trading_floor.data import market_store
+
+    settings = get_settings()
+    equity = float(snapshot.get("total_equity") or settings.starting_cash)
+    cap_per_name_dollars = equity * (settings.max_position_pct / 100.0)
+    held = {p["ticker"]: int(p["quantity"]) for p in snapshot.get("positions") or []}
+
+    sized: list[TradeProposal] = []
+    for p in proposals:
+        if p.side.value == "sell":
+            held_qty = held.get(p.ticker, 0)
+            if held_qty <= 0:
+                continue
+            new_qty = min(p.quantity, held_qty)
+            if new_qty != p.quantity:
+                sized.append(p.model_copy(update={"quantity": new_qty}))
+            else:
+                sized.append(p)
+            continue
+
+        try:
+            price = market_store.latest_close(p.ticker)
+        except ValueError:
+            continue
+        max_qty = max(1, int(cap_per_name_dollars / price))
+        new_qty = min(p.quantity, max_qty)
+        if new_qty != p.quantity:
+            sized.append(p.model_copy(update={"quantity": new_qty}))
+        else:
+            sized.append(p)
+    return sized
 
 
 async def _risk_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
@@ -96,31 +153,65 @@ async def _risk_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
     if not proposals:
         return {"assessments": [], "status_log": ["No proposals to review"]}
 
-    risk_tools = _filter(tools, ["portfolio", "risk", "audit"])
+    risk_tool_names = {
+        "assess_trade_risk", "check_drawdown", "check_position_limit",
+        "check_sector_exposure_limit", "compute_position_size",
+    }
+    risk_tools = [t for t in tools.values() if any(n in t.name for n in risk_tool_names)]
     agent = build_risk_officer(risk_tools)
+
+    extractor_llm = (
+        ChatOpenAI(model=get_settings().risk_model, temperature=0.0)
+        .with_structured_output(_VerdictPayload)
+    )
 
     assessments: list[RiskAssessment] = []
     for proposal in proposals:
         instruction = (
-            "Evaluate this TradeProposal. Use the available risk and portfolio tools "
-            "to check limits, then call log_decision on the audit server with your verdict.\n\n"
+            "Evaluate this TradeProposal. Use the risk and portfolio tools to check "
+            "position limits, sector exposure, drawdown, and cash availability. Then "
+            "call log_decision on the audit server with your verdict and reasoning.\n\n"
             f"Proposal: {proposal.model_dump_json()}\n\n"
-            "After your tool calls, output a single JSON object on the final line with keys: "
-            "approved (bool), reasons (list of strings), suggested_quantity (int or null), "
-            "risk_score (0..1)."
+            "Finally, write a brief one-paragraph summary of your decision. The system "
+            "will extract the structured verdict from your summary."
         )
-        result = await agent.ainvoke({"messages": [HumanMessage(content=instruction)]})
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=instruction)]},
+            config={"recursion_limit": 60},
+        )
         last = result["messages"][-1].content if result.get("messages") else ""
-        verdict = _parse_verdict(last)
-        assessments.append(
-            RiskAssessment(
-                proposal=proposal,
-                approved=bool(verdict.get("approved", False)),
-                reasons=list(verdict.get("reasons", [])),
-                suggested_quantity=verdict.get("suggested_quantity"),
-                risk_score=float(verdict.get("risk_score", 0.5)),
+        try:
+            verdict: _VerdictPayload = await extractor_llm.ainvoke(
+                f"Extract the structured verdict from this Risk Officer summary:\n\n{last}"
             )
+            assessment = RiskAssessment(
+                proposal=proposal,
+                approved=verdict.approved,
+                reasons=verdict.reasons,
+                suggested_quantity=verdict.suggested_quantity,
+                risk_score=verdict.risk_score,
+            )
+        except Exception as exc:
+            assessment = RiskAssessment(
+                proposal=proposal,
+                approved=False,
+                reasons=[f"verdict extraction failed: {exc}"],
+                risk_score=1.0,
+            )
+
+        audit_repo.write_entry(
+            actor="risk_officer",
+            kind="decision",
+            payload={
+                "proposal": proposal.model_dump(mode="json"),
+                "approved": assessment.approved,
+                "reasons": assessment.reasons,
+                "suggested_quantity": assessment.suggested_quantity,
+                "risk_score": assessment.risk_score,
+                "officer_summary": last,
+            },
         )
+        assessments.append(assessment)
 
     approved = sum(1 for a in assessments if a.approved)
     return {
@@ -129,25 +220,17 @@ async def _risk_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
     }
 
 
-def _parse_verdict(text: str) -> dict:
-    import re
-
-    matches = re.findall(r"\{[^{}]*\}", text, flags=re.DOTALL)
-    for chunk in reversed(matches):
-        try:
-            return json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
-    return {}
-
-
 async def _execute_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
     assessments = state.get("assessments") or []
     approved = [a for a in assessments if a.approved]
     if not approved:
         return {"executed_orders": [], "status_log": ["Nothing approved to execute"]}
 
-    exec_tools = _filter(tools, ["execution", "portfolio", "audit"])
+    trader_tool_names = {
+        "submit_market_order", "submit_limit_order", "get_order_status",
+        "list_open_orders", "get_position", "get_cash_balance",
+    }
+    exec_tools = [t for t in tools.values() if any(n in t.name for n in trader_tool_names)]
     agent = build_trader(exec_tools)
 
     executed: list[dict] = []
@@ -162,16 +245,19 @@ async def _execute_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
             f"limit_price={proposal.limit_price}\n\n"
             "On the final line, return a JSON object with the order details you submitted."
         )
-        result = await agent.ainvoke({"messages": [HumanMessage(content=instruction)]})
-        last = result["messages"][-1].content if result.get("messages") else ""
-        executed.append(
-            {
-                "ticker": proposal.ticker,
-                "side": proposal.side.value,
-                "quantity": qty,
-                "result_summary": last,
-            }
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=instruction)]},
+            config={"recursion_limit": 60},
         )
+        last = result["messages"][-1].content if result.get("messages") else ""
+        record = {
+            "ticker": proposal.ticker,
+            "side": proposal.side.value,
+            "quantity": qty,
+            "result_summary": last,
+        }
+        audit_repo.write_entry(actor="trader", kind="trade", payload=record)
+        executed.append(record)
 
     return {
         "executed_orders": executed,
