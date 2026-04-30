@@ -10,6 +10,16 @@ discover at runtime. **CrewAI** drives the collaborative research stage;
 **LangGraph** orchestrates the broader state machine, including the per-cycle
 risk review and execution loop.
 
+## Demo
+
+![Autonomous Trading Floor — Gradio UI showing a completed cycle with two filled orders](docs/screenshot.png)
+
+The web UI shows a completed trade cycle: the Researcher and Strategist
+proposed three trades (AAPL, MSFT, XOM); the Risk Officer evaluated each
+and logged a decision; the Trader executed the approved orders against the
+simulated portfolio. Open positions, account snapshot, and the per-actor
+audit trail all update live as the agents work.
+
 ## Architecture
 
 ```mermaid
