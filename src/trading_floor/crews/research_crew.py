@@ -55,12 +55,12 @@ def _coerce_proposals(raw: str) -> list[TradeProposal]:
     return []
 
 
-def run_research_crew(
+async def run_research_crew(
     watchlist: list[str],
     portfolio_snapshot: dict,
     all_tools: dict[str, BaseTool],
 ) -> tuple[str, list[TradeProposal]]:
-    """Synchronously run the CrewAI crew. Returns (research_brief, proposals)."""
+    """Run the CrewAI crew asynchronously. Returns (research_brief, proposals)."""
     research_tools = _filter(all_tools, substrings=["market_data", "news"])
     strategy_tools = _filter(
         all_tools, substrings=["market_data", "news", "portfolio", "compute_position_size"]
@@ -102,6 +102,6 @@ def run_research_crew(
         process=Process.sequential,
         verbose=False,
     )
-    result = crew.kickoff()
+    result = await crew.kickoff_async()
     final_text = str(result)
     return final_text, _coerce_proposals(final_text)

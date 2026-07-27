@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import asyncio
+import queue
 import threading
 
 import gradio as gr
@@ -93,22 +94,50 @@ async def _run_async(watchlist: list[str], cycles: int):
 
 
 def run_session_handler(tickers_text: str, cycles: int):
+    """Drive the async session generator to completion on a dedicated
+    background thread with its own event loop, handing each yielded UI
+    update back to this sync generator over a thread-safe queue.
+
+    This keeps the whole async generator — including the MCP client's
+    task group in `open_floor()` — running under a single top-level
+    asyncio Task for its entire lifetime. Driving it step-by-step with
+    repeated `loop.run_until_complete(agen.__anext__())` calls (the
+    previous approach) wraps each step in a *new* Task on the same loop,
+    which anyio rejects once a cancel scope opened under an earlier Task
+    is touched from a later one (`RuntimeError: Attempted to exit cancel
+    scope in a different task than it was entered in`).
+    """
     watchlist = [t.strip().upper() for t in tickers_text.split(",") if t.strip()] or all_tickers()
     if not _LOCK.acquire(blocking=False):
         yield "_A session is already running. Wait for it to finish._", _snapshot_text(), _positions_df(), _audit_df()
         return
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        agen = _run_async(watchlist, cycles)
-        try:
-            while True:
-                try:
-                    yield loop.run_until_complete(agen.__anext__())
-                except StopAsyncIteration:
-                    break
-        finally:
-            loop.close()
+        q: queue.Queue = queue.Queue()
+        done = object()
+
+        def _worker() -> None:
+            async def _consume() -> None:
+                async for item in _run_async(watchlist, cycles):
+                    q.put(item)
+
+            try:
+                asyncio.run(_consume())
+            except Exception as exc:  # surfaced to the UI thread below
+                q.put(exc)
+            finally:
+                q.put(done)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        while True:
+            item = q.get()
+            if item is done:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+        thread.join()
     finally:
         _LOCK.release()
 
