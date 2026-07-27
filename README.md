@@ -1,5 +1,7 @@
 # Autonomous Multi-Agent Trading Floor
 
+> Demo recorded from a local run — this app's multi-agent workload (6 MCP servers + CrewAI + LangGraph) needs more RAM than free-tier hosting provides, so there's no live link. Clone and run locally to try it yourself.
+
 A simulated trading floor where four collaborating agents — **Researcher**,
 **Strategist**, **Risk Officer**, **Trader** — independently research the
 market, propose trades, vet them against risk limits, and execute against a
@@ -11,6 +13,8 @@ discover at runtime. **CrewAI** drives the collaborative research stage;
 risk review and execution loop.
 
 ## Demo
+
+![Autonomous Trading Floor demo — a full research → risk review → execution cycle](docs/demo.gif)
 
 ![Autonomous Trading Floor — Gradio UI showing a completed cycle with two filled orders](docs/screenshot.png)
 
