@@ -12,7 +12,6 @@ Topology:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import AsyncIterator
 
@@ -88,8 +87,11 @@ _CURRENT_TOOLS: dict[str, BaseTool] | None = None
 
 
 async def _research_node(state: FloorState, tools: dict[str, BaseTool]) -> dict:
-    brief, proposals = await asyncio.to_thread(
-        run_research_crew,
+    # Awaits CrewAI's async kickoff (crew.kickoff_async()) directly, so this
+    # stays on the same task/event loop that's servicing the MCP session in
+    # mcp_client.open_floor — no thread handoff, no separate task/loop for
+    # the tool-call bridge to desync against.
+    brief, proposals = await run_research_crew(
         state["watchlist"],
         state["portfolio_snapshot"],
         tools,
