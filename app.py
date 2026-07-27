@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import asyncio
 import threading
 
@@ -155,4 +157,4 @@ with gr.Blocks(title="Autonomous Trading Floor") as ui:
 
 
 if __name__ == "__main__":
-    ui.launch()
+    ui.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
