@@ -155,4 +155,4 @@ with gr.Blocks(title="Autonomous Trading Floor") as ui:
 
 
 if __name__ == "__main__":
-    ui.launch(inbrowser=True)
+    ui.launch()
